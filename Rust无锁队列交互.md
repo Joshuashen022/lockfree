@@ -157,8 +157,7 @@ Loop{
 		Calling fill_buffer function
 	}
 
-	If origin cur_await >
-	cur_producer then sleep
+	If origin cur_await > cur_producer then sleep
 
 }
 ```
@@ -205,14 +204,14 @@ Loop{
 While i < num_nodes
 {
 
-       	If cur_producer < i then sleep
+	If cur_producer < i then sleep
        	
 	Get all the done node
 	
 	For known done nodes
 	{
        		
-		Use base_parent_missing fill ring_buf
+		Use base_parent_missing to fill ring_buf
 		Generate node[i] with ring_buf
 		i +=1
 		consumer +=1
