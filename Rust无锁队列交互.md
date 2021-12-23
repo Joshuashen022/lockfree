@@ -20,21 +20,25 @@
 
 ![总体逻辑](/lockfree/2.png "总体逻辑")
 
-**扩展阅读** 
+**预备知识** 
 
--[Linux线程与windows线程区别](https://www.cnblogs.com/leisure_chn/p/10393707.html)
+-[Linux线程](https://www.cnblogs.com/leisure_chn/p/10393707.html)
 
 -[自旋锁](https://www.cnblogs.com/cxuanBlog/p/11679883.html)
-
+自旋锁的定义：当一个线程尝试去获取某一把锁的时候，如果这个锁此时已经被别人获取(占用)，那么此线程就无法获取到这把锁，该线程将会等待，间隔一段时间后会再次尝试获取。这种采用循环加锁 -> 等待的机制被称为自旋锁(spinlock)。
 -[CAS算法](https://zhuanlan.zhihu.com/p/137261781)
+CAS操作需要我们提供一个期望值，当期望值与当前线程的变量值相同时，说明还没线程修改该值，当前线程可以进行修改，也就是执行CAS操作，但如果期望值与当前线程不符，则说明该值已被其他线程修改，此时不执行更新操作，但可以选择重新读取该变量再尝试再次修改该变量，也可以放弃操作。
 
 
-**共享内存**
+数据共享
+--------
+
+**共享内存的实现**
 
 三个线程共享两片内存，分别为本层数据内存(layer_label)，读取算法参数内存(ring_buf)，本层内存主线程(consumer)具有读写的权利，子线程(producer)只有读的权力；算法参数内存首先由子线程填充原始文件数据，再填充已经生成的新文件中的数据，并将缺失的数据标记。
 
 子线程之间共享原始文件所对应的内存，二者只负责将所对应的数据放入与主线程共享的算法参数内存中。
-![共享内存](/lockfree/3.png "共享内存")
+
 
 为了实现内存在三各个线程中共享，定义了变量`UnsafeSlice`以及`RingBuf`，`UnsafeCell`中存放的原始数据可以通过`ptr`以及`length` 重新构建，`RingBuf`的重新构建与`UnsafeSlice`相似，只不过指针需要临时获得。
 
@@ -74,9 +78,11 @@ unsafe fn slice_mut(&self) -> &mut [u8] {
 
 原始文件所对应的内存(exp_label)，当前层的文件(layer_label)类型为: UnsafeSlice。
 
+**RingBuf**
 参数内存(ring­_buf)的类型为：RingBuf，由于其大小有限，因此为环状结构，即当数据填满所有内存后会从头开始填充，覆盖掉之前的数据，因此consumer的长度不能超过producer的规定长度(lookahead)。
+![RingBuf](/lockfree/3.png "RingBuf")
 
-**共享参数**
+**共享参数的实现**
 
 主线程和子线程之间共享主线程的进度参数(consumer)和子线程总进度(cur_producer)，这两个变量的读取和修改应该为原子操作，即当一个线程在读取数据或修改时，另一个线程不能去访问这个数据。子线程的进度不能超过主线程的进度过多，否则会导致用于参数共享的内不足，并且本层数据的缺失率会增大。而主线程需要等待子线程进度超过主线程进度后才能继续执行（主线程需要子线程读取原始文件中的数据）。
 
@@ -110,26 +116,27 @@ Crossbeam::thread::scope(|s| {
 ```
 -**共享参数**
 
-```
-Layer_label: UnsafeSlice
 
-Exp_label: UnsafeSlice
+`layer_label: UnsafeSlice` 新文件数据
 
-Base_parent_missing: UnsafeSlice
+`exp_label: UnsafeSlice` 原始文件数据
 
-Consumer: AtomicU64
+`base_parent_missing: UnsafeSlice` 子线程标记的数据数据缺失
 
-Cur_producer: AtomicU64
+`consumer: AtomicU64` 主线程的进展
 
-Cur_awaiting: AtomicU64 
+`cur_producer: AtomicU64` 子线程的总进展
 
-Ring_buf: RingBuf
-```
+`cur_awaiting: AtomicU64` 子线程的已经被分配的任务
+
+`ring_buf: RingBuf` 数据传递共享内存
+
 
 子线程
 ------
+子线程通过参数实现同步，通过填充函数`fill_buffer()`完成在`ring_buf`的数据填充以及缺失节点`base_parent_missing`的标记。
 
-**重要参数**
+**输入参数**
 
 `ring_buf`（算法参数内存）：由producer所传入的参数节点
 
@@ -181,14 +188,25 @@ Loop{
 ![子线程](/lockfree/5.png "子线程")
 **填充函数**
 
-函数首先处理当前层所需要的节点对应序号的数据。由于数据来自于本层需要由主程序处理产生，因此存在概率部分节点还未产生，但基于无锁队列的设计，并且程序也不希望在此处等待这些未产生的节点，因此将这些还未产生的节点标记至`base_parent_missing`中，由主程序执行到此自行获取。
-
+函数`fill_buffer()`首先处理当前层所需要的节点对应序号的数据。由于数据来自于本层需要由主程序处理产生，因此存在概率部分节点还未产生，但基于无锁队列的设计，并且程序也不希望在此处等待这些未产生的节点，因此将这些还未产生的节点标记至`base_parent_missing`中，由主程序执行到此自行获取。
+```
+fn fill_buffer(
+    cur_node: u64,
+    parents_cache: &CacheReader<u32>,
+    mut cur_parent: &[u32], 
+    layer_labels: &UnsafeSlice<'_, u32>,
+    exp_labels: Option<&UnsafeSlice<'_, u32>>, 
+    buf: &mut [u8],
+    base_parent_missing: &mut BitMask,
+) 
+```
 在标记完毕本层的数据后，取出放入缓存中或者标记为"missing"。程序从上层节点取出数据，写入buffer（上层数据已经产生，因此不存在missing的情况）。
 
 主线程
 ------
+主函数从`ring_buf`中读取当前已经准备好的数据，从`base_parent_missing`读取缺失的数据自行填充，然后计算得到新文件中的当前节点的数据。
 
-**传入参数**
+**输入参数**
 
 `ring_buf`：由producer所传入的参数节点
 
