@@ -26,7 +26,7 @@
 子线程之间共享原始文件所对应的内存，二者只负责将所对应的数据放入与主线程共享的算法参数内存中。
 ![共享内存](/lockfree/3.png "共享内存")
 
-为了实现内存在三各个线程中共享，定义了变量UnsafeSlice{…}以及RingBuf{…}，UnsafeCell中存放的原始数据可以通过ptr以及length 重新构建，RingBuf的重新构建与UnsafeSlice相似，只不过指针需要临时获得。
+为了实现内存在三各个线程中共享，定义了变量`UnsafeSlice`以及`RingBuf`，`UnsafeCell`中存放的原始数据可以通过`ptr`以及`length` 重新构建，`RingBuf`的重新构建与`UnsafeSlice`相似，只不过指针需要临时获得。
 
 ```
 #[derive(Debug)]
@@ -46,6 +46,21 @@ pub struct RingBuf {
 	num_slots: usize,
 }
 ```
+`UnsafeSlice`的重构方法
+```
+#[inline]
+pub unsafe fn as_mut_slice(&self) -> &'a mut [T] {
+    slice::from_raw_parts_mut(self.ptr, self.len)
+}
+```
+
+`RingBuf`的重构方法
+```
+#[allow(clippy::mut_from_ref)]
+unsafe fn slice_mut(&self) -> &mut [u8] {
+    slice::from_raw_parts_mut((*self.data.get()).as_mut_ptr(), self.len())
+}
+```
 
 原始文件所对应的内存(exp_label)，当前层的文件(layer_label)类型为: UnsafeSlice。
 
@@ -63,12 +78,29 @@ pub struct RingBuf {
 
 用crossbeam开辟三个线程，首先启动子线程producer，然后执行主线程consumer的循环，直至所有节点产生完毕。
 
-`Crossbeam::thread::scope(|s| { … })`
-
+```
+Crossbeam::thread::scope(|s| {
+    let mut runners = Vec::with_capacity(num_producers);
+     
+     for i in 0..num_producers {
+        
+        // sub-thread consumer 
+        runners.push(s.spawn(move |_| {
+        // read data
+        }))
+     }
+     
+     // main-thread producer 
+     // calculate
+     for runner in runners {
+            runner.join().expect("join failed");
+     }
+     
+}).expect("crossbeam scope failure");
+```
 -**共享参数**
 
 ```
-**共享参数**
 Layer_label: UnsafeSlice
 
 Exp_label: UnsafeSlice
@@ -111,7 +143,7 @@ Ring_buf: RingBuf
 
 **伪代码**
 
-子线程执行一个循环结构，当所有的任务都被分配完毕时(cur_awaiting >= num_nodes)退出循环。函数大致分为两部分，同步部分和填充数据部分，读取数据通过调用读取函数实现。
+子线程执行一个循环结构，当所有的任务都被分配完毕时`cur_awaiting >= num_nodes`退出循环。函数大致分为两部分，同步部分和填充数据部分，读取数据通过调用读取函数实现。
 
 ```
 Loop{
@@ -133,18 +165,16 @@ Loop{
 
 **线程同步**
 
-子线程(producer)之间通过共同维护，子线程总进度变量(cur_producer)，子线程“占位”变量(cur_awaiting)实现同步。对于每个子线程首先从“占位”变量中取出已经被分配的任务节点(work)，向占位变量增加一定的长度告知其他子线程此处任务已经被分配。而在一个子线程获取占位变量后，便可以执行数据填充操作，在向算法参数内存(ring_buf)中填充数据前需要判断待填充数据的序号不能领先主程序超过预留的节点个数（lookahead），否则算法参数内存中还未使用的数据将会被覆盖掉，在要填充的数据序号不领先于主线程一定长度(lookahead)长度的情况下，将数据填充至共享内存当中，即
+子线程(producer)之间通过共同维护，子线程总进度变量`cur_producer`，子线程“占位”变量`cur_awaiting`实现同步。对于每个子线程首先从“占位”变量中取出已经被分配的任务节点，向占位变量增加一定的长度告知其他子线程此处任务已经被分配。而在一个子线程获取占位变量后，便可以执行数据填充操作，在向算法参数内存`ring_buf`中填充数据前需要判断待填充数据的序号不能领先主程序超过预留的节点个数`lookahead`，否则算法参数内存中还未使用的数据将会被覆盖掉，在要填充的数据序号不领先于主线程一定长度`lookahead`长度的情况下，将数据填充至共享内存当中，假设子线程当前的进度为`p`，那么应满足`p - consumer <=lookahead`
 
-`p2-consumer <= lookahead`
-
-填充完数据后，子线程不能直接调节子线程总进度变量(cur_producer)，需要判断之前节点的参数是否填充完毕，如果填充完毕则可以修改cur_producer变量，告知所有线程producer的新完成了部分数据，并且存放在ring_buf中，这样不会ring_buf中不会出现有些数据还未填充，但producer的变量已经显示完毕的情况，与主线程实现同步。
+填充完数据后，子线程不能直接调节子线程总进度变量`cur_producer`，需要判断之前节点的参数是否填充完毕，如果填充完毕则可以修改`cur_producer`变量，告知所有线程(producer)的新完成了部分数据，并且存放在`ring_buf`中，这样不会`ring_buf`中不会出现有些数据还未填充但其他线程(producer)的变量已经显示完毕的情况，与主线程实现同步。
 
 ![子线程](/lockfree/5.png "子线程")
 **填充函数**
 
-函数首先处理当前层所需要的节点对应序号的数据。由于数据来自于本层需要由主程序处理产生，因此存在概率部分节点还未产生，但基于无锁队列的设计，并且程序也不希望在此处等待这些未产生的节点，因此将这些还未产生的节点标记至bpm中，由主程序执行到此自行获取。
+函数首先处理当前层所需要的节点对应序号的数据。由于数据来自于本层需要由主程序处理产生，因此存在概率部分节点还未产生，但基于无锁队列的设计，并且程序也不希望在此处等待这些未产生的节点，因此将这些还未产生的节点标记至`base_parent_missing`中，由主程序执行到此自行获取。
 
-在标记完毕本层的数据后，取出放入buffer或者标记为missing。程序从上层节点取出数据，写入buffer（上层数据已经产生，因此不存在missing的情况）。
+在标记完毕本层的数据后，取出放入缓存中或者标记为"missing"。程序从上层节点取出数据，写入buffer（上层数据已经产生，因此不存在missing的情况）。
 
 主线程
 ------
@@ -192,16 +222,32 @@ While i < num_nodes
 
 **主线程执行流程**
 
-首先从共享变量中取出cur_producer，并等待主线程中的当前序号数(i)小于producer的总进度时(cur_producer> i)，然后根据现有所有已完成的producer的节点进行运算。
+首先从共享变量中取出`cur_producer`，并等待主线程中的当前序号数(i)小于producer的总进度时`cur_producer> i`，然后根据现有所有已完成的producer的节点进行运算。
 
-对于已知的consumer完成的所有节点，进行如下操作。首先从base_parent_missing中读取缺失的本层节点填充至ring_buf中，为接下来的运算做准备。当计算完毕后，首先将consumer 变量自增（告诉所有子线程已经计算完毕），再把其他必要的变量自增，为下一个节点的计算做准备。当所有已经准备好的节点计算完毕后，需要再次访问判断是否有准备好的节点，如果有则与上相同将所有节点取出并运算。
+对于已知的consumer完成的所有节点，进行如下操作。首先从`base_parent_missing`中读取缺失的本层节点填充至`ring_buf`中，为接下来的运算做准备。当计算完毕后，将consumer 变量自增（告诉所有子线程已经计算完毕），再把其他必要的变量自增，为下一个节点的计算做准备。当所有已经准备好的节点计算完毕后，需要再次访问判断是否有准备好的节点，如果有则与上相同将所有节点取出并运算。
 ![主线程](/lockfree/6.png "主线程")
 
 整体模型
 --------
 
+"producer"和"consumer"通过`ring_buf`交互，实现同步。
 ![整体模型](/lockfree/7.png "整体模型")
 
+源代码
+------
 
+```
+fn create_layer_labels(
+    parents_cache: &CacheReader<u32>,
+    replica_id: &[u8],
+    layer_labels: &mut MmapMut,
+    exp_labels: Option<&mut MmapMut>,
+    num_nodes: u64,
+    cur_layer: u32,
+    core_group: Arc<Option<MutexGuard<'_, Vec<CoreIndex>>>>,
+) 
+```
+[code](https://github.com/filecoin-project/rust-fil-proofs/blob/master/storage-proofs-porep/src/stacked/vanilla/create_label/multi.rs)
+ at `fn create_layer_labels()`
 
 
