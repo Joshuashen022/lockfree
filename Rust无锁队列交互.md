@@ -19,10 +19,15 @@
 为了提升程序的效率，将全部的待运算数据放入内存中连续的地址中，对于复杂的运算，这样会大大提高程序的运行效率。
 
 ![总体逻辑](/lockfree/2.png "总体逻辑")
+
 **扩展阅读** 
+
 -[Linux线程与windows线程区别](https://www.cnblogs.com/leisure_chn/p/10393707.html)
+
 -[自旋锁](https://www.cnblogs.com/cxuanBlog/p/11679883.html)
+
 -[CAS算法](https://zhuanlan.zhihu.com/p/137261781)
+
 
 **共享内存**
 
